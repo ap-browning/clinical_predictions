@@ -1,3 +1,5 @@
+using Plots
+
 gr()
 default()
 default(
@@ -22,7 +24,7 @@ function add_plot_labels!(plt;offset=0)
     plot!(
         titlelocation = :left,
         titlefontsize = 10,
-        titlefontfamily = "Arial"
+        titlefontfamily = "Helvetica"
     )
 end
 

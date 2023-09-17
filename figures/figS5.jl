@@ -1,100 +1,89 @@
 #=
-    Figures S5
+    Figure S5
 
-    Actual patients (remain)
+    Additional synthetic patients
 =#
 
 using CSV, DataFrames, DataFramesMeta
 using Plots, StatsPlots
-using DifferentialEquations
-using Distributions
-using .Threads
 using StatsBase
-using KernelDensity
 using LinearAlgebra
+using Random 
+using .Threads
 
 include("defaults.jl")
 include("../analysis/models.jl")
 include("../analysis/data.jl")
-include("../analysis/classifier.jl")
+include("../analysis/inference.jl")
+
+################################################
+## PLOT PARAMETERS
+################################################
+
+tmax = 56.0
+tplt = range(0.0,tmax,200)
 
 ################################################
 ## LOAD PRIOR SAMPLES
 ################################################
 
-include("../analysis/prior1.jl")
-df = CSV.read("analysis/prior2.csv",DataFrame)
-prior2 = Matrix(df)[:,4:end]
-prior2c = [eachrow(prior2)...]
+prior2 = CSV.read("analysis/prior2.csv",DataFrame)
+prior2.row = 1:nrow(prior2)
+X = Matrix(prior2[:,2:end-1])
+Xc = [eachrow(X)...]
 
-# Bandwidth (Silverman's rule)
-n,d = size(prior2)
-Σ = Diagonal((4 / (d + 2))^(1 / (d + 4)) * n^(-1 / (d + 4)) * std.(eachcol(prior2)))^2
-kd = MvNormal(Σ)
+################################################
+## CREATE THREE SYNTHETIC PATIENTS (from within posterior1)
+################################################
 
-# Expansion factor
-β = 2.0
-
-# Sample from prior
-prior = zeros(40000,d) .+ Inf
-for i = axes(prior,1)
-    while !insupport(prior1,prior[i,:])
-        prior[i,:] = rand(prior2c) + β * rand(kd)
-    end
-end
-priorc = [eachrow(prior)...]
+# Load posterior1
+posterior1 = CSV.read("analysis/posterior1.csv",DataFrame)
+posterior1.row = 1:nrow(posterior1)
 
 # Load noise model
 α = CSV.read("analysis/noise_model.csv",DataFrame).α
 
+# Treatment regime
+timeᵢ = [0;2:8] * 7.0
+doseᵢ = (2.0*7.0):(8.0*7.0)
+doseᵢ = doseᵢ[mod.(doseᵢ,7) .< 5]
 
-################################################
-## FUNCTION TO CALCULATE WEIGHTS
-################################################
+# Model
+model(lp) = model(lp,timeᵢ,doseᵢ;ret=:function)
 
-function get_weights(timeᵢ,doseᵢ,vols)
-    # Observation times
-    time = timeᵢ[eachindex(vols)]
-    # Model
-    model = lp -> solve_model_twocompartment(exp.(lp);tdose=doseᵢ,tend=maximum(time),output=:total)
-    # Calculate weights
-    w = zeros(size(prior,1))
-    @threads for i = eachindex(w)
-        # Simulate model
-        y = model(prior[i,:]).(time)
-        # Compute likelihood
-        w[i] = pdf(MvNormal(y,α[1] .+ α[2] * y),vols)
-    end
-    return w / sum(w)
+# Synthetic patient parameters (now sampled from full posterior)
+rng = MersenneTwister(4)
+patient_rows = [rand(rng,@subset(posterior1,:class .== i).row) for i = [1,1,2,2,3,3,4,4]]
+lp = [Vector(posterior1[row,5:end]) for row in patient_rows]
+
+# Store noisy volume measurements
+vols = Array{Vector}(undef,length(patient_rows))
+
+# Loop through each patient, add noise
+for i in eachindex(patient_rows)
+
+    # Generate synthetic data
+    vols[i] = model(lp[i]).(timeᵢ)
+    vols[i][2:end] += rand(rng,MvNormal(α[1] .+ α[2] * vols[i][2:end]))
+
 end
-
-################################################
-## GET REMAINING PATIENTS
-################################################
-
-remaining_id = setdiff(unique(data.ID),[patient_id; training_id])
 
 ################################################
 ## PERFORM INFERENCE USING PARTIAL DATA
 ################################################
 
-# Up to the following measurement times
-upto = [2,3,4,5,6,7,8]
-
-# Initialise storage for weights and synthetic patient data
-w = [Array{Vector}(undef,length(upto)) for _ = 1:length(remaining_id)]
+W = Array{Any}(undef,length(patient_rows))
+M = Array{Any}(undef,length(patient_rows))
+M̄ = Array{Any}(undef,length(patient_rows))
 
 # Loop through each patient
-for (i,id) in enumerate(remaining_id)
+@threads for i = eachindex(patient_rows)
+    
+    # Calculate weights
+    W[i],M[i] = get_weights(X,α,timeᵢ,doseᵢ,vols[i])
 
-    # Get patient specific data
-    timeᵢ,volsᵢ,doseᵢ = normalised_data[id]
-
-    # Loop through observation times (to get weights)
-    for j = eachindex(upto)
-        max_idx = min(length(timeᵢ),upto[j])
-        w[i][j] = get_weights(timeᵢ,doseᵢ,volsᵢ[1:max_idx])
-    end
+    # Calculate full model traces for plotting
+    M̄[i] = hcat([model(lp,timeᵢ,doseᵢ;ret=:function).(tplt) for lp = Xc]...)'
 
 end
 
@@ -102,40 +91,59 @@ end
 ## Figure S5
 ################################################
 
-plts = [Array{Any}(undef,length(upto)) for _ = 1:length(remaining_id)]
+# Which time indices to plot upto?
+upto = [2,4,6,8]
+
+plts = [Array{Any}(undef,length(upto)) for _ = 1:length(patient_rows)]
 
 # Loop through plots
-for (i,id) = enumerate(remaining_id), j = eachindex(upto)
+for i = eachindex(patient_rows), j = eachindex(upto)
 
-    # Get patient specific data
-    timeᵢ,volsᵢ,doseᵢ = normalised_data[id]
+    # Confidence bands
+    l1,l2,u2,u1 = [[quantile(v,Weights(W[i][:,upto[j]]),q) for v in eachcol(M̄[i])] for q = [0.025,0.25,0.75,0.975]]
 
-    # Fix for some patients with fewer observations
-    max_idx = min(length(timeᵢ),upto[j])
+    # Mean
+    μ = [mean(v,Weights(W[i][:,upto[j]])) for v in eachcol(M̄[i])]
 
-    # Patient specific model
-    model = lp -> solve_model_twocompartment(exp.(lp);tdose=doseᵢ,tend=maximum(timeᵢ),output=:total)
+    # Index of current upto time
+    idx_max = tplt[end] == timeᵢ[upto[j]] ? length(tplt) : findfirst(tplt .> timeᵢ[upto[j]])
 
-    # Make predictions
-    lps = sample(priorc,Weights(w[i][j]),200)
-    plts[i][j] = plot([model(lp) for lp in lps],label="",c=:black,α=0.05,xlim=(0.0,timeᵢ[max_idx]))
-    plot!(plts[i][j],[model(lp) for lp in lps],label="",c=col_posterior,α=0.1,xlim=(timeᵢ[max_idx],maximum(timeᵢ)))
+    # Plot confidence bands
+    plts[i][j] = plot(tplt[1:idx_max],u1[1:idx_max],frange=l1[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(plts[i][j],tplt[1:idx_max],u2[1:idx_max],frange=l2[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(plts[i][j],tplt[idx_max:end],u1[idx_max:end],frange=l1[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+    plot!(plts[i][j],tplt[idx_max:end],u2[idx_max:end],frange=l2[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+
+    # Plot mean
+    plot!(plts[i][j],tplt[1:idx_max],μ[1:idx_max],c=:black,lw=2.0,label="",fα=0.4)
+    plot!(plts[i][j],tplt[idx_max:end],μ[idx_max:end],c=col_posterior,lw=2.0,label="",fα=0.4)
 
     # Plot observed data at present
-    scatter!(plts[i][j],timeᵢ[1:max_idx],volsᵢ[1:max_idx],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(plts[i][j],timeᵢ[1:max_idx],volsᵢ[1:max_idx],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
+    scatter!(plts[i][j],timeᵢ[1:upto[j]],vols[i][1:upto[j]],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(plts[i][j],timeᵢ[1:upto[j]],vols[i][1:upto[j]],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
 
     # Plot future observed data
-    scatter!(plts[i][j],timeᵢ[max_idx+1:end],volsᵢ[max_idx+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(plts[i][j],timeᵢ[max_idx+1:end],volsᵢ[max_idx+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
+    scatter!(plts[i][j],timeᵢ[upto[j]+1:end],vols[i][upto[j]+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(plts[i][j],timeᵢ[upto[j]+1:end],vols[i][upto[j]+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
 
     # Plot present time
-    vline!(plts[i][j],[timeᵢ[max_idx]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
-    
+    vline!(plts[i][j],[timeᵢ[upto[j]]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
+
+    # Calculate and plot R² value
+    R² = median([Bayesian_R²(M[i][idx,:],vols[i]) for idx = sample(1:nrow(prior2),Weights(W[i][:,upto[j]]),1000)])
+    R² = round(R²,sigdigits=3)
+    plot!(plts[i][j],title="R² = $R²",titlefontsize=10)
+
 end
 
-plts_patient = [plot(plts[i][1:2:end]...,layout=grid(1,4),link=:all,ylim=(0.0,2.0),xticks=0:14:56,xlim=(-4.0,60.0)) for i in eachindex(remaining_id)]
+plts_patient = [plot(plts[i]...,layout=grid(1,4),link=:all,ylim=(0.0,1.3),xticks=0:14:maximum(timeᵢ),xlim=(-4.0,maximum(timeᵢ) + 4.0)) for i in eachindex(patient_rows)]
+plot!(plts_patient[5],ylim=(0.0,2.2))
+plot!(plts_patient[6],ylim=(0.0,2.2))
+plot!(plts_patient[7],ylim=(0.0,9.2),yticks=(0:3:9,["0.0","3.0","6.0","9.0"]))
+plot!(plts_patient[8],ylim=(0.0,3.2),yticks=(0:3,["0.0","1.0","2.0","3.0"]))
 
-# Figure S5
-figS5 = plot(plts_patient...,layout=grid(7,1),size=(800,1200),xlabel="Time [d]",link=:all)
+
+# Figure 5
+figS5 = plot(plts_patient...,layout=grid(8,1),size=(800,1200),xlabel="Time [d]",link=:all)
 savefig(figS5,"$(@__DIR__)/figS5.svg")
+figS5

@@ -51,3 +51,4 @@ function solve_model_twocompartment(p;tdose=[],tend=:auto,output=:all,verbose=fa
 end
 
 twocompartment_params = ["λ","K","γ","ζ","η","ϕ₀"]
+twocompartment_params_expanded = ["λ","K","γ","ζ","η","ϕ₀","α₁","α₂"]

@@ -4,18 +4,16 @@
     Setup standard patient course of treatment and classification algorithm
 =#
 
-include("../analysis/models.jl")
+include("models.jl")
+include("inference.jl")
 
 # Setup "standard" treatment regime
 timeᵢ = [0;2:8] * 7.0
 doseᵢ = (2.0*7.0):(8.0*7.0)
 doseᵢ = doseᵢ[mod.(doseᵢ,7) .< 5]
 
-# Model
-model = lp -> solve_model_twocompartment(exp.(lp);tdose=doseᵢ,tend=maximum(timeᵢ),output=:total)
-
 # Classifier
-function classify(lp;α₁=0.0,α₂=0.0)
+function classify(lp;α₁=0.0,α₂=0.0,time=timeᵢ,dose=doseᵢ)
     # 1. Fast responder
     # 2. Poor responder
     #       - All above 0.85 of volume at start of treatment
@@ -27,7 +25,7 @@ function classify(lp;α₁=0.0,α₂=0.0)
     #       - Second measurement is greater than 102% of the first
 
     # Simulate standard patient
-    volsᵢ = model(lp).(timeᵢ)[2:end]
+    volsᵢ = model(lp,time,dose)[2:end]
 
     # Add noise (if required)
     if (α₁ > 0.0) || (α₂ > 0.0)

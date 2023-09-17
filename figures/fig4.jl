@@ -15,14 +15,14 @@ include("defaults.jl")
 ################################################
 
 include("../analysis/prior1.jl")
-df = CSV.read("analysis/prior2.csv",DataFrame)
+df = CSV.read("analysis/posterior1.csv",DataFrame)
 
 ################################################
 ## PLOTS
 ################################################
 
-# Start from λ (ignore V₀)
-offset = 3
+# Start from λ
+offset = 4
 
 # Settings
 cmaps = [:Greens_7,:Oranges_7,:PuBu_7,:RdPu_7]
@@ -48,7 +48,7 @@ for i = 1:6, j = 1:6
         # Produce 2D density plots
         for class = [1,2,3,4]
             @df @subset(df,:class .== class) density2d!(plts[i,j],cols(offset + j),cols(offset + i),
-                levels=10,fill=true,c=cmaps[class],lw=0.0,z_clip=0.4,α=0.4,xlim=lims[j],ylim=lims[i])
+                levels=10,fill=true,c=cmaps[class],lw=0.0,z_clip=0.5,α=0.4,xlim=lims[j],ylim=lims[i])
             plot!(plts[i,j],xlabel=names(df)[offset + j],ylabel=names(df)[offset + i])
         end
     else

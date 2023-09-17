@@ -1,5 +1,5 @@
 #=
-    FIGURE 11 (ROW 2)
+    FIGURE 11
 
     Predictions using tumour breakdown measurements
 =#
@@ -16,39 +16,34 @@ using LinearAlgebra
 include("defaults.jl")
 include("../analysis/models.jl")
 include("../analysis/data.jl")
+include("../analysis/inference.jl")
+
+################################################
+## PLOT PARAMETERS
+################################################
+
+tmax = 56.0
+tplt = range(0.0,tmax,200)
 
 ################################################
 ## LOAD PRIOR SAMPLES
 ################################################
 
-include("../analysis/prior1.jl")
-df = CSV.read("analysis/prior2.csv",DataFrame)
-prior2 = Matrix(df)[:,4:end]
-prior2c = [eachrow(prior2)...]
+prior2 = CSV.read("analysis/prior2.csv",DataFrame)
+prior2.row = 1:nrow(prior2)
+X = Matrix(prior2[:,2:end-1])
+Xc = [eachrow(X)...]
 
-# Bandwidth (Silverman's rule)
-n,d = size(prior2)
-Σ = Diagonal((4 / (d + 2))^(1 / (d + 4)) * n^(-1 / (d + 4)) * std.(eachcol(prior2)))^2
-kd = MvNormal(Σ)
+################################################
+## CREATE THREE SYNTHETIC PATIENTS (from within posterior1)
+################################################
 
-# Expansion factor
-β = 2.0
-
-# Sample from prior
-prior = zeros(100000,d) .+ Inf
-for i = axes(prior,1)
-    while !insupport(prior1,prior[i,:])
-        prior[i,:] = rand(prior2c) + β * rand(kd)
-    end
-end
-priorc = [eachrow(prior)...]
+# Load posterior1
+posterior1 = CSV.read("analysis/posterior1.csv",DataFrame)
+posterior1.row = 1:nrow(posterior1)
 
 # Load noise model
 α = CSV.read("analysis/noise_model.csv",DataFrame).α
-
-################################################
-## CREATE THREE SYNTHETIC PATIENTS (from within prior2)
-################################################
 
 # Treatment regime
 timeᵢ = [0;2:8] * 7.0
@@ -56,148 +51,168 @@ doseᵢ = (2.0*7.0):(8.0*7.0)
 doseᵢ = doseᵢ[mod.(doseᵢ,7) .< 5]
 
 # Model
-model = lp -> solve_model_twocompartment(exp.(lp);tdose=doseᵢ,tend=maximum(timeᵢ),output=:both)
+model(lp) = model(lp,timeᵢ,doseᵢ;output=:all)
 
-################################################
-## GENERATE SYNTHETIC PATIENT DATA
-################################################
+# Find a synthetic patient with the desired behaviour...
+patient_row = 26160
+lp = Vector(posterior1[patient_row,5:end])
 
-# Seeds to generate patients
-patient_row = 35394
-lp = Vector(df[patient_row,4:4+5])
-
-# Generate synthetic data
-vols,necs = eachcol(vcat(model(lp).(timeᵢ)...))
+# Sample synthetic data
+m = hcat(model(lp)...)
+vols = sum(m,dims=1)[:]
+necs = m[2,:]
 
 # Add noise
-vols[2:end] += rand(MvNormal(α[1] .+ α[2] * vols[2:end]))
-necs += rand(MvNormal(α[1] .+ α[2] * necs))
-
+rng = MersenneTwister(3)
+vols[2:end] .+= rand(rng,MvNormal(α[1] .+ α[2] * vols[2:end]))
+necs .+= rand(rng,MvNormal(α[1] .+ α[2] * necs))
 
 ################################################
 ## FUNCTION TO CALCULATE WEIGHTS
 ################################################
 
-function get_weights(vols,necs)
-    time = timeᵢ[eachindex(vols)]
-    w = zeros(size(prior,1))
-    w2 = zeros(size(prior,1))
-    @threads for i = eachindex(w)
-        # Simulate model
-        y = vcat(model(prior[i,:]).(time)...)
-        # Compute likelihood
-        w[i] = pdf(MvNormal(y[:,1],α[1] .+ α[2] * y[:,1]),vols) * 
-               pdf(MvNormal(y[:,2],α[1] .+ α[2] * y[:,2]),necs) 
-        # Compute likelihood without using necrotic data
-        w2[i] = pdf(MvNormal(y[:,1],α[1] .+ α[2] * y[:,1]),vols)
+function get_weights(prior,α,time,dose,vols,necs;final_only=false)
+    # Model prediction for each sampled parameter
+    m = hcat([hcat(model(lp,time,dose;output=:all)...)'[:] for lp in eachrow(prior)]...)'
+    # Matrix of [GTV necrotic]
+    m[:,1:length(time)] += m[:,length(time)+1:end]
+    # Corresponding std based on α
+    σ = α[1] .+ m * α[2]
+    # loglikelihood contribution from each time point
+    ll = hcat([logpdf.(d,[vols;necs]) for d in eachrow(Normal.(m,σ))]...)'
+    # loglikelihood for each time point (both volume and necrotic, considered to be independent)
+    ll = ll[:,1:length(time)] + ll[:,length(time)+1:end]
+    # Calculate matrix of weights
+    like = exp.(cumsum(ll,dims=2))
+    w = like ./ sum(like,dims=1)
+    if final_only
+        w = w[:,end]
     end
-    return w / sum(w), w2 / sum(w2)
+    return w,m
 end
-
 
 ################################################
 ## PERFORM INFERENCE USING PARTIAL DATA
 ################################################
 
-# Up to the following measurement times
-upto = [2,3,4,5,6,7,8]
+# Using both necrotic and volume data
+W,M = get_weights(X,α,timeᵢ,doseᵢ,vols,necs)
 
-# Initialise storage for weights and synthetic patient data
-w = Array{Vector}(undef,length(upto))
-w2 = Array{Vector}(undef,length(upto))
+# Model predictions (both)
+M̄ = hcat([hcat(model(lp,tplt,doseᵢ;output=:all)...)'[:] for lp in Xc]...)'
 
-# Loop through observation times (to get weights)
-for j = eachindex(upto)
-    w[j],w2[j] = get_weights(vols[1:upto[j]],necs[1:upto[j]])
-end
+# Model predictions (GTV and N(t))
+V = M̄[:,1:length(tplt)] + M̄[:,length(tplt)+1:end]
+N = M̄[:,length(tplt)+1:end]
+
+# Using only volume data
+W2, = get_weights(X,α,timeᵢ,doseᵢ,vols)
 
 ################################################
-## FIGURE 11, PARTS 1 AND 2
+## FIGURE 11 PARTS 1 AND 2
 ################################################
 
-idx = 3 # Index of "upto" for which we will plot predictions
+idx = 4 # Predictions are shown at timeᵢ[idx]
+idx_max = findfirst(tplt .> timeᵢ[idx])
+idx_max = idx_max === nothing ? length(tplt) : idx_max
 
 fig11a = plot()
 fig11b = plot()
 
-# Make predictions
-lps = sample(priorc,Weights(w[idx]),200)
-models = [model(lp) for lp in lps]
-
 # == TOTAL VOLUME ==
-    # Plot predictions
-    plot!(fig11a,[t -> m(t)[1] for m in models],label="",c=:black,α=0.03,xlim=(0.0,timeᵢ[upto[idx]]))
-    plot!(fig11a,[t -> m(t)[1] for m in models],label="",c=col_posterior,α=0.05,xlim=(timeᵢ[upto[idx]],maximum(timeᵢ)))
+    l1,l2,u2,u1 = [[quantile(v,Weights(W[:,idx]),q) for v in eachcol(V)] for q = [0.025,0.25,0.75,0.975]]
+    μ = [mean(v,Weights(W[:,idx])) for v in eachcol(V)]
+
+    # Plot confidence bands
+    plot!(fig11a,tplt[1:idx_max],u1[1:idx_max],frange=l1[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(fig11a,tplt[1:idx_max],u2[1:idx_max],frange=l2[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(fig11a,tplt[idx_max:end],u1[idx_max:end],frange=l1[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+    plot!(fig11a,tplt[idx_max:end],u2[idx_max:end],frange=l2[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+
+    # Plot mean
+    plot!(fig11a,tplt[1:idx_max],μ[1:idx_max],c=:black,lw=2.0,label="",fα=0.4)
+    plot!(fig11a,tplt[idx_max:end],μ[idx_max:end],c=col_posterior,lw=2.0,label="",fα=0.4)
 
     # Plot observed data at present
-    scatter!(fig11a,timeᵢ[1:upto[idx]],vols[1:upto[idx]],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(fig11a,timeᵢ[1:upto[idx]],vols[1:upto[idx]],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
+    scatter!(fig11a,timeᵢ[1:idx],vols[1:idx],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(fig11a,timeᵢ[1:idx],vols[1:idx],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
 
     # Plot future observed data
-    scatter!(fig11a,timeᵢ[upto[idx]+1:end],vols[upto[idx]+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(fig11a,timeᵢ[upto[idx]+1:end],vols[upto[idx]+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
+    scatter!(fig11a,timeᵢ[idx+1:end],vols[idx+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(fig11a,timeᵢ[idx+1:end],vols[idx+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
 
     # Plot present time
-    vline!(fig11a,[timeᵢ[upto[idx]]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
+    vline!(fig11a,[timeᵢ[idx]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
 
 # == NECROTIC VOLUME
-    # Plot predictions
-    plot!(fig11b,[t -> m(t)[2] for m in models],label="",c=:black,α=0.03,xlim=(0.0,timeᵢ[upto[idx]]))
-    plot!(fig11b,[t -> m(t)[2] for m in models],label="",c=col_posterior,α=0.05,xlim=(timeᵢ[upto[idx]],maximum(timeᵢ)))
+    l1,l2,u2,u1 = [[quantile(v,Weights(W[:,idx]),q) for v in eachcol(N)] for q = [0.025,0.25,0.75,0.975]]
+    μ = [mean(v,Weights(W[:,idx])) for v in eachcol(N)]
+
+    # Plot confidence bands
+    plot!(fig11b,tplt[1:idx_max],u1[1:idx_max],frange=l1[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(fig11b,tplt[1:idx_max],u2[1:idx_max],frange=l2[1:idx_max],c=:black,lw=0.0,label="",fα=0.4)
+    plot!(fig11b,tplt[idx_max:end],u1[idx_max:end],frange=l1[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+    plot!(fig11b,tplt[idx_max:end],u2[idx_max:end],frange=l2[idx_max:end],c=col_posterior,lw=0.0,label="",fα=0.4)
+
+    # Plot mean
+    plot!(fig11b,tplt[1:idx_max],μ[1:idx_max],c=:black,lw=2.0,label="",fα=0.4)
+    plot!(fig11b,tplt[idx_max:end],μ[idx_max:end],c=col_posterior,lw=2.0,label="",fα=0.4)
 
     # Plot observed data at present
-    scatter!(fig11b,timeᵢ[1:upto[idx]],necs[1:upto[idx]],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(fig11b,timeᵢ[1:upto[idx]],necs[1:upto[idx]],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
+    scatter!(fig11b,timeᵢ[1:idx],necs[1:idx],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(fig11b,timeᵢ[1:idx],necs[1:idx],ylim=(0.0,:auto),ms=3,widen=true,c=:black,label="")
 
     # Plot future observed data
-    scatter!(fig11b,timeᵢ[upto[idx]+1:end],necs[upto[idx]+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
-    scatter!(fig11b,timeᵢ[upto[idx]+1:end],necs[upto[idx]+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
+    scatter!(fig11b,timeᵢ[idx+1:end],necs[idx+1:end],ylim=(0.0,:auto),widen=true,msc=:black,ms=6.0,α=0.5,msw=2.0,mc=:white,label="",xlim=extrema(timeᵢ))
+    scatter!(fig11b,timeᵢ[idx+1:end],necs[idx+1:end],ylim=(0.0,:auto),ms=3,widen=true,c=:black,α=0.5,label="")
 
     # Plot present time
-    vline!(fig11b,[timeᵢ[upto[idx]]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
+    vline!(fig11b,[timeᵢ[idx]],c=:black,lw=2.0,ls=:dash,label="",widen=true)
 
+plot!(fig11a,ylim=(0.0,1.3))
+plot!(fig11b,ylim=(0.0,1.3))
 
 ################################################
 ## FIGURE 11, PART 3
 ################################################
 
 # Calculate predicted final tumour volume for each prior sample
-F = [model(lp).(timeᵢ[end])[1] for lp in priorc]
-Factual = model(lp).(timeᵢ[end])[1]
+F = M[:,length(timeᵢ)]
+Factual = sum(model(lp)[end])
 
 # Loop through patients
 fig11c = plot()
 
 # Plot predictions using necrotic data
-μ = [mean(F,Weights(wᵢⱼ)) for wᵢⱼ in w]
-l = [quantile(F,Weights(wᵢⱼ),0.025) for wᵢⱼ in w]
-u = [quantile(F,Weights(wᵢⱼ),0.975) for wᵢⱼ in w]
-
-scatter!(fig11c,timeᵢ[upto],μ,yerror=(μ-l,u-μ),msw=2.0,mc=:black,label="")
+μ = [mean(F,Weights(wᵢⱼ)) for wᵢⱼ in eachcol(W)]
+l1,l2,u2,u1 = [[quantile(F,Weights(wᵢⱼ),q) for wᵢⱼ in eachcol(W)] for q = [0.025,0.25,0.75,0.975]]
+for j = eachindex(timeᵢ)[2:end]
+    plot!(fig11c,timeᵢ[j]*[1.0,1.0],[l1[j],u1[j]],lw=8.0,c=:blue,α=0.2,label="")
+    plot!(fig11c,timeᵢ[j]*[1.0,1.0],[l2[j],u2[j]],lw=8.0,c=:blue,α=0.3,label="")
+end
+scatter!(fig11c,timeᵢ[2:end],μ[2:end],c=:blue,ms=4.0,label="")
 
 # Plot predictions using only total volume data
-μ = [mean(F,Weights(wᵢⱼ)) for wᵢⱼ in w2]
-l = [quantile(F,Weights(wᵢⱼ),0.025) for wᵢⱼ in w2]
-u = [quantile(F,Weights(wᵢⱼ),0.975) for wᵢⱼ in w2]
-
-scatter!(fig11c,timeᵢ[upto] .- 3.0,μ,yerror=(μ-l,u-μ),msw=2.0,α=0.5,mc=:black,label="")
+μ = [mean(F,Weights(wᵢⱼ)) for wᵢⱼ in eachcol(W2)]
+l1,l2,u2,u1 = [[quantile(F,Weights(wᵢⱼ),q) for wᵢⱼ in eachcol(W2)] for q = [0.025,0.25,0.75,0.975]]
+for j = eachindex(timeᵢ)[2:end]
+    plot!(fig11c,timeᵢ[j]*[1.0,1.0] .- 2.0,[l1[j],u1[j]],lw=8.0,c=:black,α=0.3,label="")
+    plot!(fig11c,timeᵢ[j]*[1.0,1.0] .- 2.0,[l2[j],u2[j]],lw=8.0,c=:black,α=0.3,label="")
+end
+scatter!(fig11c,timeᵢ[2:end] .- 2.0,μ[2:end],c=:black,ms=4.0,label="")
 
 # Plot true volume
-hline!(fig11c,[Factual[i]],c=col_posterior,lw=2.0,ls=:dash,label="",xticks=0:7:Int(maximum(timeᵢ)))
+hline!(fig11c,[Factual[1]],c=col_posterior,lw=2.0,ls=:dash,label="",xticks=0:7:Int(maximum(timeᵢ)))
 
 
 ################################################
 ## FIGURE 11
 ################################################
 
-# y limits
-plot!(fig11a,ylim=(0.0,1.3))
-plot!(fig11b,ylim=(0.0,1.3))
-plot!(fig11c,ylim=(0.0,1.3))
-
-# Format Fig 9c (inset)
+# Format Fig 11c (inset)  
 fig11cd = plot(fig11c,fig11c,layout=grid(2,1))
-plot!(fig11cd,subplot=2,ylim=(0.75,1.25),widen=true)
+plot!(fig11cd,subplot=1,ylim=(0.0,1.5),widen=true)
+plot!(fig11cd,subplot=2,ylim=(0.4,1.1),widen=true)
 
 # Construct figure
 fig11 = plot(fig11a,fig11b,fig11cd,layout=grid(1,3),xticks=0:14:maximum(timeᵢ),xlim=(-4.0,maximum(timeᵢ) + 4.0),widen=true,size=(850,250))
@@ -213,5 +228,5 @@ plot!(fig11,subplot=2,ylabel="Necrotic volume")
 plot!(fig11,xlabel="Time [d]")
 plot!(fig11,subplot=3,xlabel="")
 
-savefig(fig11,"$(@__DIR__)/fig11_row2.svg")
+savefig(fig11,"$(@__DIR__)/fig11_pt2.svg")
 fig11

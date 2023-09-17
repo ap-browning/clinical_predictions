@@ -20,29 +20,24 @@ include("../analysis/classifier.jl")
 ## LOAD PRIOR SAMPLES
 ################################################
 
-include("../analysis/prior1.jl")
-df = CSV.read("analysis/prior2.csv",DataFrame)
-prior2 = Matrix(df)[:,4:end]
-prior2c = [eachrow(prior2)...]
+prior2 = CSV.read("analysis/prior2.csv",DataFrame)
+prior2.row = 1:nrow(prior2)
 
-# Bandwidth (Silverman's rule)
-n,d = size(prior2)
-Σ = Diagonal((4 / (d + 2))^(1 / (d + 4)) * n^(-1 / (d + 4)) * std.(eachcol(prior2)))^2
-kd = MvNormal(Σ)
+X = Matrix(prior2[:,2:end-1])
+Xc = [eachrow(X)...]
 
-# Expansion factor
-β = 2.0
+################################################
+## SAMPLE PARAMETER VALUES UNDER EACH CLASSIFICATION
+################################################
 
-# Sample m samples from each classification
-m = 10
-lp = [zeros(m,d) .+ Inf for _ = 1:4]
-for c = 1:4, i = 1:m
-    class = Inf
-    while !insupport(prior1,lp[c][i,:]) || class != c
-        lp[c][i,:] = rand(prior2c) + β * rand(kd)
-        class = classify(lp[c][i,:])
-    end
-end
+# Number in each class
+neach = 8
+
+# Rows to look at
+idx = [sample(@subset(prior2,:class .== i).row,8,replace=false) for i = 1:4]
+
+# Parameter values to look at
+lp = [Xc[i] for i in idx]
 
 ################################################
 ## TREATMENT REGIME AND PATIENT SIMULATOR
@@ -54,14 +49,14 @@ doseᵢ = (2.0*7.0):(8.0*7.0)
 doseᵢ = doseᵢ[mod.(doseᵢ,7) .< 5]
 
 # Model
-model = lp -> solve_model_twocompartment(exp.(lp);tdose=doseᵢ,tend=maximum(timeᵢ),output=:total)
+model(lp) = model(lp,timeᵢ,doseᵢ;ret=:function)
 
 ################################################
 ## SIMULATE PATIENTS OF EACH CLASSIFICATION
 ################################################
 
 # Simulate
-f = hcat([[model(lpᵢ) for lpᵢ in eachrow(lp[c])] for c = 1:4]...);
+f = hcat([[model(lpᵢ) for lpᵢ in lp[c]] for c = 1:4]...);
 
 # Plot
 plts = plot.(f,xlim=(0.0,maximum(timeᵢ)),lw=2.0,c=:black)
@@ -74,5 +69,6 @@ for p in plts
     vline!(p,[14.0],α=0.3,lw=2.0,c=:black,ls=:dash)
 end
 
-plot(permutedims(plts,[2,1])...,layout=grid(m,4),size=(700,1500),legend=:none,xticks=0:14:56,xlabel="Time [d]",ylabel="Volume [FC]")
+figS4 = plot(permutedims(plts,[2,1])...,layout=grid(neach,4),size=(1000,1400),right_margin=10Plots.mm,legend=:none,
+    xticks=0:14:56,xlabel="Time [d]",ylabel="Volume [FC]")
 savefig("$(@__DIR__)/figS4.svg")
